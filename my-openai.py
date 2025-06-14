@@ -1,10 +1,11 @@
-from distilabel.models import ClientvLLM
 import os
+
+from distilabel.models.llms import OpenAILLM
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-llm = ClientvLLM(
+llm = OpenAILLM(
     base_url=os.getenv("OPENAI_API_BASE"),
     model=os.getenv("MODEL_NAME"),
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -14,3 +15,4 @@ llm = ClientvLLM(
 llm.load()
 
 output = llm.generate_outputs(inputs=[[{"role": "user", "content": "Hello world!"}]])
+print(output)
