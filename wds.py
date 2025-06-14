@@ -2,7 +2,6 @@ import os
 import sys
 import asyncio
 import re
-import logging
 from dotenv import load_dotenv
 from datasets import load_dataset, Dataset
 from tqdm.asyncio import tqdm_asyncio
@@ -16,6 +15,8 @@ OPENAI_API_BASE = os.getenv("OPENAI_API_BASE")
 MODEL_NAME = os.getenv("MODEL_NAME")
 HF_REPO = os.getenv("HF_REPO")  # ex: username/my_dataset
 HF_PRIVATE = os.getenv("HF_PRIVATE", "false") == "true"
+
+MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 3000))
 
 if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO]):
     print(
@@ -58,7 +59,7 @@ TRANSLATION_SYSTEM_PROMPT = TRANSLATION_SYSTEM_PROMPT.replace(
 
 def apply_dynamic_regex(original: str, text: str) -> str:
     sanitized = re.escape(original)
-    pattern = re.compile(f"[\n ,.?!0-9A-Za-z\uac00-\ud7af<>/thinkTHINK{sanitized}]*")
+    pattern = re.compile(f"[\n ,.?!<>/0-9A-Za-z\uac00-\ud7afthink{sanitized}]*")
     m = pattern.match(text)
     return m.group(0) if m else text.strip()
 
@@ -81,8 +82,11 @@ async def translate_one(item):
 async def main():
     print("📥 데이터 로딩 중...")
     ds = load_dataset("common-pile/arxiv_abstracts_filtered", split="train")
-    ds = ds.select(range(min(500, len(ds))))
-    data = [{"text": t} for t in ds["text"]]
+    if MAX_PROCESSED_ROWS == -1:
+        data = [{"text": t} for t in ds["text"]]
+    else:
+        ds = ds.select(range(min(MAX_PROCESSED_ROWS, len(ds))))
+        data = [{"text": t} for t in ds["text"]]
 
     print(f"🔁 번역 시작: {len(data)}건, 동시 {MAX_CONCURRENT}건 처리")
     results = await tqdm_asyncio.gather(*(translate_one(item) for item in data))
