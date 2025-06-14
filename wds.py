@@ -57,26 +57,27 @@ TRANSLATION_SYSTEM_PROMPT = TRANSLATION_SYSTEM_PROMPT.replace(
 )
 
 
-def apply_dynamic_regex(original: str, text: str) -> str:
-    sanitized = re.escape(original)
-    pattern = re.compile(f"[\n ,.?!<>/0-9A-Za-z\uac00-\ud7afthink{sanitized}]*")
-    m = pattern.match(text)
-    return m.group(0) if m else text.strip()
-
-
 @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=5))
 async def translate_one(item):
     src = item["text"]
     prompt = TRANSLATION_SYSTEM_PROMPT.replace("{{ instruction }}", src)
+    sanitized_for_regex = re.escape(src)
+
     async with semaphore:
         res = await client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=int(os.getenv("MAX_NEW_TOKENS", 32768)),
             temperature=0.7,
+            extra_body={
+                "response_format": {
+                    "type": "regex",
+                    "schema": f"[\n ,.?</>!0-9think\uac00-\ud7af{sanitized_for_regex}]*",
+                },
+            },
         )
         raw = res.choices[0].message.content
-        return {"original_text": src, "korean_abstract": apply_dynamic_regex(src, raw)}
+        return {"original_text": src, "text": raw.strip()}
 
 
 async def main():
