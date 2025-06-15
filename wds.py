@@ -102,10 +102,12 @@ async def translate_one(item):
                 temperature=0.7,
                 top_p=0.8,
                 extra_body={
-                    "response_format": {
-                        "type": "regex",
-                        "schema": schema,
-                    },
+                    "min_p": 0,
+                    "top_k": 20,
+                    # "response_format": {
+                    #     "type": "regex",
+                    #     "schema": schema,
+                    # },
                 },
             )
             raw = res.choices[0].message.content
@@ -129,9 +131,9 @@ async def translate_one(item):
 # ✅✅✅ 핵심 수정 사항: gather_with_dynamic_concurrency 함수 ✅✅✅
 async def gather_with_dynamic_concurrency(
     tasks,
-    initial_concurrency=16,
+    initial_concurrency=1024,
     max_concurrency=MAX_CONCURRENT,
-    step=8,
+    step=512,
 ):
     """
     요청된 동적 병렬성 로직을 사용하여 작업을 처리하고 단일 tqdm으로 진행률을 표시합니다.
@@ -165,7 +167,7 @@ async def gather_with_dynamic_concurrency(
             progress_bar.update(num_processed_in_batch)
 
             # 병렬성 증가 조건 확인
-            threshold = concurrency * 4
+            threshold = concurrency * 2
             if concurrency < max_concurrency and items_processed_in_stage >= threshold:
                 # 다음 병렬성 단계로 업데이트
                 concurrency = min(concurrency + step, max_concurrency)
