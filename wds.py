@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
 from openai import AsyncOpenAI
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load .env file
 load_dotenv(override=True)
@@ -96,7 +96,9 @@ logger.handlers.clear()
 logger.addHandler(handler)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=120))
+@retry(
+    stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=80000)
+)
 async def translate_one(item):
     async with semaphore:
         src = item["text"]
@@ -124,6 +126,7 @@ async def translate_one(item):
                 max_tokens=int(os.getenv("MAX_NEW_TOKENS", 32768)),
                 temperature=0.7,
                 top_p=0.8,
+                timeout=80000,
                 extra_body={
                     "min_p": 0,
                     "top_k": 20,
@@ -154,9 +157,9 @@ async def translate_one(item):
 # ✅✅✅ 핵심 수정 사항: gather_with_dynamic_concurrency 함수 ✅✅✅
 async def gather_with_dynamic_concurrency(
     tasks,
-    initial_concurrency=512,
+    initial_concurrency=256,
     max_concurrency=MAX_CONCURRENT,
-    step=128,
+    step=256,
 ):
     """
     슬라이딩 윈도우 방식으로 동적 병렬성을 구현하여 연속적인 작업 처리를 보장합니다.
