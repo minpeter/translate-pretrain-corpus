@@ -17,7 +17,7 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 HF_REPO = os.getenv("HF_REPO")  # Example: username/my_dataset
 HF_PRIVATE = os.getenv("HF_PRIVATE", "false") == "true"
 
-MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 1000))
+MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 10000))
 
 if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO]):
     print(
