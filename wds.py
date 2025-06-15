@@ -2,9 +2,10 @@ import os
 import sys
 import asyncio
 import re
+import logging
 from dotenv import load_dotenv
 from datasets import load_dataset, Dataset
-from tqdm.asyncio import tqdm_asyncio
+from tqdm import tqdm
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
@@ -69,16 +70,18 @@ TRANSLATION_SYSTEM_PROMPT = TRANSLATION_SYSTEM_PROMPT.replace(
     "<TARGET_LANGUAGE>", "Korean"
 )
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=120))
 async def translate_one(item):
-    src = item["text"]
-    prompt = TRANSLATION_SYSTEM_PROMPT.replace("<INSTRUCTION>", src)
-    sanitized_for_regex = re.escape(src)
-    open_think = re.escape("<think>")
-    close_think = re.escape("</think>")
-
     async with semaphore:
+        src = item["text"]
+        prompt = TRANSLATION_SYSTEM_PROMPT.replace("<INSTRUCTION>", src)
+        sanitized_for_regex = re.escape(src)
+        open_think = re.escape("<think>")
+        close_think = re.escape("</think>")
+
         allowed_chars = (
             "\n"
             " ,.?!"
@@ -91,67 +94,86 @@ async def translate_one(item):
         allowed_chars = "".join(allowed_chars)
         schema = f"[{allowed_chars}]*"
 
-        res = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=int(os.getenv("MAX_NEW_TOKENS", 32768)),
-            temperature=0.7,
-            top_p=0.8,
-            extra_body={
-                "response_format": {
-                    "type": "regex",
-                    "schema": schema,
+        try:
+            res = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=int(os.getenv("MAX_NEW_TOKENS", 32768)),
+                temperature=0.7,
+                top_p=0.8,
+                extra_body={
+                    "response_format": {
+                        "type": "regex",
+                        "schema": schema,
+                    },
                 },
-            },
-        )
-        raw = res.choices[0].message.content
+            )
+            raw = res.choices[0].message.content
 
-        # Extract content inside <think> tags if present, otherwise use the entire text
-        think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
-        if think_match:
-            translated = think_match.group(1).strip()
-            # Extract and combine text outside <think> tags
-            before = raw[: think_match.start()].strip()
-            after = raw[think_match.end() :].strip()
-            # Combine all text if translation is not limited to <think> tags
-            if before or after:
-                translated = "\n".join([before, translated, after]).strip()
-        else:
-            translated = raw.strip()
+            think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
+            if think_match:
+                translated = think_match.group(1).strip()
+                before = raw[: think_match.start()].strip()
+                after = raw[think_match.end() :].strip()
+                if before or after:
+                    translated = "\n".join([before, translated, after]).strip()
+            else:
+                translated = raw.strip()
 
-        return {"original_text": src, "text": translated}
+            return {"original_text": src, "text": translated}
+        except Exception as e:
+            logging.error(f"Translation failed for text: {src}. Error: {e}")
+            raise
 
 
-async def gather_with_warmup(
+# ✅✅✅ 핵심 수정 사항: gather_with_dynamic_concurrency 함수 ✅✅✅
+async def gather_with_dynamic_concurrency(
     tasks,
-    initial_concurrency=4,
+    initial_concurrency=16,
     max_concurrency=MAX_CONCURRENT,
-    step=4,
-    step_interval=50,
+    step=8,
 ):
+    """
+    요청된 동적 병렬성 로직을 사용하여 작업을 처리하고 단일 tqdm으로 진행률을 표시합니다.
+    """
     results = []
-    concurrency = initial_concurrency
-    idx = 0
     total = len(tasks)
-    while idx < total:
-        batch_size = min(concurrency, total - idx)
-        batch = tasks[idx : idx + batch_size]
-        # Use a new semaphore for concurrency control
-        batch_semaphore = asyncio.Semaphore(concurrency)
+    idx = 0
 
-        async def sem_task(task):
-            async with batch_semaphore:
-                return await task
+    # 동적 병렬성 로직을 위한 상태 변수
+    concurrency = initial_concurrency
+    items_processed_in_stage = 0
 
-        batch_results = await tqdm_asyncio.gather(*(sem_task(t) for t in batch))
-        results.extend(batch_results)
-        idx += batch_size
-        # Increase concurrency periodically
-        if concurrency < max_concurrency and (idx // step_interval) > (
-            (idx - batch_size) // step_interval
-        ):
-            concurrency = min(concurrency + step, max_concurrency)
-            print(f"[Warmup] Increasing concurrency: {concurrency}")
+    # 단일 tqdm 진행률 표시줄 생성
+    with tqdm(
+        total=total, desc=f"Parallelism: {concurrency}", unit="item"
+    ) as progress_bar:
+        while idx < total:
+            # 처리할 배치 크기를 현재 병렬성과 남은 작업 수에 따라 결정
+            batch_size = min(concurrency, total - idx)
+            batch_tasks = tasks[idx : idx + batch_size]
+
+            # asyncio.gather를 직접 사용하여 추가적인 진행률 표시줄 생성을 방지
+            batch_results = await asyncio.gather(*batch_tasks)
+
+            results.extend(batch_results)
+
+            # 카운터 및 진행률 표시줄 업데이트
+            num_processed_in_batch = len(batch_results)
+            idx += num_processed_in_batch
+            items_processed_in_stage += num_processed_in_batch
+            progress_bar.update(num_processed_in_batch)
+
+            # 병렬성 증가 조건 확인
+            threshold = concurrency * 4
+            if concurrency < max_concurrency and items_processed_in_stage >= threshold:
+                # 다음 병렬성 단계로 업데이트
+                concurrency = min(concurrency + step, max_concurrency)
+                # 현재 단계에서 처리된 항목 수 초기화
+                items_processed_in_stage = 0
+                # 진행률 표시줄에 새로운 병렬성 수준 표시
+                progress_bar.set_description(f"Parallelism: {concurrency}")
+
     return results
 
 
@@ -164,13 +186,14 @@ async def main():
         ds = ds.select(range(min(MAX_PROCESSED_ROWS, len(ds))))
         data = [{"text": t} for t in ds["text"]]
 
-    print(
-        f"🔁 Starting translation: {len(data)} items, processing {MAX_CONCURRENT} concurrently (warmup enabled)"
-    )
-    tasks = [translate_one(item) for item in data]
-    results = await gather_with_warmup(tasks)
+    # 불필요한 출력문 제거
+    # print(f"🔁 Starting translation: {len(data)} items...")
 
-    print("🔄 Converting to Dataset object...")
+    tasks = [translate_one(item) for item in data]
+    # 수정된 함수 호출
+    results = await gather_with_dynamic_concurrency(tasks)
+
+    print("\n🔄 Converting to Dataset object...")
     new_ds = Dataset.from_list(results)
 
     print(f"⬆️ Uploading to Hub: {HF_REPO} (private={HF_PRIVATE})")
