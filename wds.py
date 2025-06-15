@@ -16,7 +16,7 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 HF_REPO = os.getenv("HF_REPO")  # ex: username/my_dataset
 HF_PRIVATE = os.getenv("HF_PRIVATE", "false") == "true"
 
-MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 500))
+MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 1000))
 
 if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO]):
     print(
@@ -96,7 +96,7 @@ async def translate_one(item):
             messages=[{"role": "user", "content": prompt}],
             max_tokens=int(os.getenv("MAX_NEW_TOKENS", 32768)),
             temperature=0.7,
-            top_p=0.95,
+            top_p=0.8,
             extra_body={
                 "response_format": {
                     "type": "regex",
@@ -122,6 +122,39 @@ async def translate_one(item):
         return {"original_text": src, "text": translated}
 
 
+async def gather_with_warmup(
+    tasks,
+    initial_concurrency=4,
+    max_concurrency=MAX_CONCURRENT,
+    step=4,
+    step_interval=50,
+):
+    results = []
+    concurrency = initial_concurrency
+    idx = 0
+    total = len(tasks)
+    while idx < total:
+        batch_size = min(concurrency, total - idx)
+        batch = tasks[idx : idx + batch_size]
+        # 동시성 제한을 위해 새로운 세마포어 사용
+        batch_semaphore = asyncio.Semaphore(concurrency)
+
+        async def sem_task(task):
+            async with batch_semaphore:
+                return await task
+
+        batch_results = await tqdm_asyncio.gather(*(sem_task(t) for t in batch))
+        results.extend(batch_results)
+        idx += batch_size
+        # 일정 주기마다 동시성 증가
+        if concurrency < max_concurrency and (idx // step_interval) > (
+            (idx - batch_size) // step_interval
+        ):
+            concurrency = min(concurrency + step, max_concurrency)
+            print(f"[웜업] 동시성 증가: {concurrency}")
+    return results
+
+
 async def main():
     print("📥 데이터 로딩 중...")
     ds = load_dataset("common-pile/arxiv_abstracts_filtered", split="train")
@@ -131,8 +164,9 @@ async def main():
         ds = ds.select(range(min(MAX_PROCESSED_ROWS, len(ds))))
         data = [{"text": t} for t in ds["text"]]
 
-    print(f"🔁 번역 시작: {len(data)}건, 동시 {MAX_CONCURRENT}건 처리")
-    results = await tqdm_asyncio.gather(*(translate_one(item) for item in data))
+    print(f"🔁 번역 시작: {len(data)}건, 동시 {MAX_CONCURRENT}건 처리 (웜업 적용)")
+    tasks = [translate_one(item) for item in data]
+    results = await gather_with_warmup(tasks)
 
     print("🔄 Dataset 객체로 변환 중...")
     new_ds = Dataset.from_list(results)
