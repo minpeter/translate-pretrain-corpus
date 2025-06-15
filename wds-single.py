@@ -3,8 +3,6 @@ import sys
 import asyncio
 import re
 from dotenv import load_dotenv
-from datasets import load_dataset, Dataset
-from tqdm.asyncio import tqdm_asyncio
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
@@ -13,19 +11,13 @@ load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE")
 MODEL_NAME = os.getenv("MODEL_NAME")
-HF_REPO = os.getenv("HF_REPO")  # ex: username/my_dataset
-HF_PRIVATE = os.getenv("HF_PRIVATE", "false") == "true"
 
-MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 500))
-
-if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO]):
-    print(
-        "❌ .env 설정 오류: OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO 필요"
-    )
+if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME]):
+    print("❌ .env 설정 오류: OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME 필요")
     sys.exit(1)
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE)
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
+MAX_CONCURRENT = 1  # 단일 요청만 허용
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 TRANSLATION_SYSTEM_PROMPT = """You are a highly skilled translator with expertise in multiple languages, formal academic writing, general documents, LLM prompts, letters, and poems. Your task is to translate the given text into <TARGET_LANGUAGE> while adhering to strict guidelines.
@@ -70,7 +62,7 @@ TRANSLATION_SYSTEM_PROMPT = TRANSLATION_SYSTEM_PROMPT.replace(
 )
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=120))
+@retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=5))
 async def translate_one(item):
     src = item["text"]
     prompt = TRANSLATION_SYSTEM_PROMPT.replace("<INSTRUCTION>", src)
@@ -98,6 +90,8 @@ async def translate_one(item):
             temperature=0.7,
             top_p=0.95,
             extra_body={
+                "min_p": 0,
+                "top_k": 20,
                 "response_format": {
                     "type": "regex",
                     "schema": schema,
@@ -123,23 +117,27 @@ async def translate_one(item):
 
 
 async def main():
-    print("📥 데이터 로딩 중...")
-    ds = load_dataset("common-pile/arxiv_abstracts_filtered", split="train")
-    if MAX_PROCESSED_ROWS == -1:
-        data = [{"text": t} for t in ds["text"]]
-    else:
-        ds = ds.select(range(min(MAX_PROCESSED_ROWS, len(ds))))
-        data = [{"text": t} for t in ds["text"]]
 
-    print(f"🔁 번역 시작: {len(data)}건, 동시 {MAX_CONCURRENT}건 처리")
-    results = await tqdm_asyncio.gather(*(translate_one(item) for item in data))
+    # 단일 입력 테스트
+    input_text = """We study the two-particle wave function of paired atoms in a Fermi gas with
+tunable interaction strengths controlled by Feshbach resonance. The Cooper pair
+wave function is examined for its bosonic characters, which is quantified by
+the correction of Bose enhancement factor associated with the creation and
+annihilation composite particle operators. An example is given for a
+three-dimensional uniform gas. Two definitions of Cooper pair wave function are
+examined. One of which is chosen to reflect the off-diagonal long range order
+(ODLRO). Another one corresponds to a pair projection of a BCS state. On the
+side with negative scattering length, we found that paired atoms described by
+ODLRO are more bosonic than the pair projected definition. It is also found
+that at $(k_F a)^{-1} \\ge 1$, both definitions give similar results, where more
+than 90% of the atoms occupy the corresponding molecular condensates."""
+    item = {"text": input_text}
 
-    print("🔄 Dataset 객체로 변환 중...")
-    new_ds = Dataset.from_list(results)
-
-    print(f"⬆️ Hub로 업로드 중: {HF_REPO} (private={HF_PRIVATE})")
-    new_ds.push_to_hub(HF_REPO, private=HF_PRIVATE, token=os.getenv("HF_TOKEN"))
-    print("✅ 업로드 완료!")
+    print("\n[입력 텍스트]")
+    print(input_text)
+    result = await translate_one(item)
+    print("\n[번역 결과]")
+    print(result["text"])
 
 
 if __name__ == "__main__":
