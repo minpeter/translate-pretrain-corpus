@@ -6,18 +6,20 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
-# .env 로드
+# Load .env file
 load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE")
 MODEL_NAME = os.getenv("MODEL_NAME")
 
 if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME]):
-    print("❌ .env 설정 오류: OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME 필요")
+    print(
+        "❌ .env configuration error: OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME are required"
+    )
     sys.exit(1)
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE)
-MAX_CONCURRENT = 1  # 단일 요청만 허용
+MAX_CONCURRENT = 1  # Allow only single request
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 TRANSLATION_SYSTEM_PROMPT = """You are a highly skilled translator with expertise in multiple languages, formal academic writing, general documents, LLM prompts, letters, and poems. Your task is to translate the given text into <TARGET_LANGUAGE> while adhering to strict guidelines.
@@ -100,14 +102,14 @@ async def translate_one(item):
         )
         raw = res.choices[0].message.content
 
-        # <think> 태그가 있으면 그 안의 내용만 추출, 없으면 전체 사용
+        # Extract content inside <think> tags if present, otherwise use the entire text
         think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
         if think_match:
             translated = think_match.group(1).strip()
-            # <think> 태그 외의 나머지 텍스트(번역 결과)도 추출하여 합침
+            # Extract and combine text outside <think> tags
             before = raw[: think_match.start()].strip()
             after = raw[think_match.end() :].strip()
-            # 번역 결과가 <think> 태그 안에만 있지 않으면 모두 합침
+            # Combine all text if translation is not limited to <think> tags
             if before or after:
                 translated = "\n".join([before, translated, after]).strip()
         else:
@@ -118,7 +120,7 @@ async def translate_one(item):
 
 async def main():
 
-    # 단일 입력 테스트
+    # Single input test
     input_text = """We study the two-particle wave function of paired atoms in a Fermi gas with
 tunable interaction strengths controlled by Feshbach resonance. The Cooper pair
 wave function is examined for its bosonic characters, which is quantified by
@@ -133,10 +135,10 @@ that at $(k_F a)^{-1} \\ge 1$, both definitions give similar results, where more
 than 90% of the atoms occupy the corresponding molecular condensates."""
     item = {"text": input_text}
 
-    print("\n[입력 텍스트]")
+    print("\n[Input Text]")
     print(input_text)
     result = await translate_one(item)
-    print("\n[번역 결과]")
+    print("\n[Translation Result]")
     print(result["text"])
 
 

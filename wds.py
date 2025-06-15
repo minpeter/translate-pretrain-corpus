@@ -8,19 +8,19 @@ from tqdm.asyncio import tqdm_asyncio
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
-# .env 로드
+# Load .env file
 load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE")
 MODEL_NAME = os.getenv("MODEL_NAME")
-HF_REPO = os.getenv("HF_REPO")  # ex: username/my_dataset
+HF_REPO = os.getenv("HF_REPO")  # Example: username/my_dataset
 HF_PRIVATE = os.getenv("HF_PRIVATE", "false") == "true"
 
 MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 1000))
 
 if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO]):
     print(
-        "❌ .env 설정 오류: OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO 필요"
+        "❌ .env configuration error: OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO are required"
     )
     sys.exit(1)
 
@@ -106,14 +106,14 @@ async def translate_one(item):
         )
         raw = res.choices[0].message.content
 
-        # <think> 태그가 있으면 그 안의 내용만 추출, 없으면 전체 사용
+        # Extract content inside <think> tags if present, otherwise use the entire text
         think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
         if think_match:
             translated = think_match.group(1).strip()
-            # <think> 태그 외의 나머지 텍스트(번역 결과)도 추출하여 합침
+            # Extract and combine text outside <think> tags
             before = raw[: think_match.start()].strip()
             after = raw[think_match.end() :].strip()
-            # 번역 결과가 <think> 태그 안에만 있지 않으면 모두 합침
+            # Combine all text if translation is not limited to <think> tags
             if before or after:
                 translated = "\n".join([before, translated, after]).strip()
         else:
@@ -136,7 +136,7 @@ async def gather_with_warmup(
     while idx < total:
         batch_size = min(concurrency, total - idx)
         batch = tasks[idx : idx + batch_size]
-        # 동시성 제한을 위해 새로운 세마포어 사용
+        # Use a new semaphore for concurrency control
         batch_semaphore = asyncio.Semaphore(concurrency)
 
         async def sem_task(task):
@@ -146,17 +146,17 @@ async def gather_with_warmup(
         batch_results = await tqdm_asyncio.gather(*(sem_task(t) for t in batch))
         results.extend(batch_results)
         idx += batch_size
-        # 일정 주기마다 동시성 증가
+        # Increase concurrency periodically
         if concurrency < max_concurrency and (idx // step_interval) > (
             (idx - batch_size) // step_interval
         ):
             concurrency = min(concurrency + step, max_concurrency)
-            print(f"[웜업] 동시성 증가: {concurrency}")
+            print(f"[Warmup] Increasing concurrency: {concurrency}")
     return results
 
 
 async def main():
-    print("📥 데이터 로딩 중...")
+    print("📥 Loading dataset...")
     ds = load_dataset("common-pile/arxiv_abstracts_filtered", split="train")
     if MAX_PROCESSED_ROWS == -1:
         data = [{"text": t} for t in ds["text"]]
@@ -164,16 +164,18 @@ async def main():
         ds = ds.select(range(min(MAX_PROCESSED_ROWS, len(ds))))
         data = [{"text": t} for t in ds["text"]]
 
-    print(f"🔁 번역 시작: {len(data)}건, 동시 {MAX_CONCURRENT}건 처리 (웜업 적용)")
+    print(
+        f"🔁 Starting translation: {len(data)} items, processing {MAX_CONCURRENT} concurrently (warmup enabled)"
+    )
     tasks = [translate_one(item) for item in data]
     results = await gather_with_warmup(tasks)
 
-    print("🔄 Dataset 객체로 변환 중...")
+    print("🔄 Converting to Dataset object...")
     new_ds = Dataset.from_list(results)
 
-    print(f"⬆️ Hub로 업로드 중: {HF_REPO} (private={HF_PRIVATE})")
+    print(f"⬆️ Uploading to Hub: {HF_REPO} (private={HF_PRIVATE})")
     new_ds.push_to_hub(HF_REPO, private=HF_PRIVATE, token=os.getenv("HF_TOKEN"))
-    print("✅ 업로드 완료!")
+    print("✅ Upload complete!")
 
 
 if __name__ == "__main__":
