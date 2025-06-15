@@ -97,7 +97,7 @@ logger.addHandler(handler)
 
 
 @retry(
-    stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=80000)
+    stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=180, max=80000)
 )
 async def translate_one(item):
     async with semaphore:
