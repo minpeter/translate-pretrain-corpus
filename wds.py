@@ -17,7 +17,7 @@ MODEL_NAME = os.getenv("MODEL_NAME")
 HF_REPO = os.getenv("HF_REPO")  # Example: username/my_dataset
 HF_PRIVATE = os.getenv("HF_PRIVATE", "false") == "true"
 
-MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", 10000))
+MAX_PROCESSED_ROWS = int(os.getenv("MAX_PROCESSED_ROWS", -1))
 
 if not all([OPENAI_API_KEY, OPENAI_API_BASE, MODEL_NAME, HF_REPO]):
     print(
@@ -70,7 +70,30 @@ TRANSLATION_SYSTEM_PROMPT = TRANSLATION_SYSTEM_PROMPT.replace(
     "<TARGET_LANGUAGE>", "Korean"
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+# 전역 tqdm 객체를 위한 변수
+global_progress_bar = None
+
+
+# 커스텀 로깅 핸들러 클래스
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if global_progress_bar is not None:
+                global_progress_bar.write(msg)
+            else:
+                print(msg)
+        except Exception:
+            self.handleError(record)
+
+
+# 로깅 설정
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+handler = TqdmLoggingHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+logger.handlers.clear()
+logger.addHandler(handler)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(min=1, max=120))
@@ -131,57 +154,96 @@ async def translate_one(item):
 # ✅✅✅ 핵심 수정 사항: gather_with_dynamic_concurrency 함수 ✅✅✅
 async def gather_with_dynamic_concurrency(
     tasks,
-    initial_concurrency=1024,
+    initial_concurrency=512,
     max_concurrency=MAX_CONCURRENT,
-    step=512,
+    step=128,
 ):
     """
-    요청된 동적 병렬성 로직을 사용하여 작업을 처리하고 단일 tqdm으로 진행률을 표시합니다.
+    슬라이딩 윈도우 방식으로 동적 병렬성을 구현하여 연속적인 작업 처리를 보장합니다.
+    이전 배치가 끝나기를 기다리지 않고 작업이 완료되는 즉시 새 작업을 시작합니다.
     """
-    results = []
+    results = [None] * len(tasks)  # 결과를 원래 순서대로 저장
     total = len(tasks)
-    idx = 0
 
     # 동적 병렬성 로직을 위한 상태 변수
-    concurrency = initial_concurrency
+    concurrency = min(initial_concurrency, max_concurrency)
     items_processed_in_stage = 0
 
-    # 단일 tqdm 진행률 표시줄 생성
+    # 현재 실행 중인 작업들을 추적
+    running_tasks = {}  # task_id -> (asyncio.Task, original_index)
+    task_idx = 0  # 다음에 시작할 작업의 인덱스
+    completed_count = 0
+
+    # 단일 tqdm 진행률 표시줄 생성 (하단 고정)
+    global global_progress_bar
     with tqdm(
-        total=total, desc=f"Parallelism: {concurrency}", unit="item"
+        total=total,
+        desc=f"Parallelism: {concurrency}",
+        unit="item",
+        position=0,
+        leave=True,
+        dynamic_ncols=True,
     ) as progress_bar:
-        while idx < total:
-            # 처리할 배치 크기를 현재 병렬성과 남은 작업 수에 따라 결정
-            batch_size = min(concurrency, total - idx)
-            batch_tasks = tasks[idx : idx + batch_size]
+        global_progress_bar = progress_bar  # 전역 변수에 설정
 
-            # asyncio.gather를 직접 사용하여 추가적인 진행률 표시줄 생성을 방지
-            batch_results = await asyncio.gather(*batch_tasks)
+        while completed_count < total:
+            # 1. 현재 동시성 한도까지 새 작업들을 시작
+            while len(running_tasks) < concurrency and task_idx < total:
+                original_idx = task_idx
+                task = asyncio.create_task(tasks[original_idx])
+                running_tasks[task] = original_idx
+                task_idx += 1
 
-            results.extend(batch_results)
+            # 2. 실행 중인 작업들 중에서 완료된 것들을 찾아 처리
+            if running_tasks:
+                # 최소 하나의 작업이 완료될 때까지 대기
+                done, pending = await asyncio.wait(
+                    running_tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
 
-            # 카운터 및 진행률 표시줄 업데이트
-            num_processed_in_batch = len(batch_results)
-            idx += num_processed_in_batch
-            items_processed_in_stage += num_processed_in_batch
-            progress_bar.update(num_processed_in_batch)
+                # 완료된 작업들 처리
+                for completed_task in done:
+                    original_idx = running_tasks[completed_task]
 
-            # 병렬성 증가 조건 확인
-            threshold = concurrency * 2
-            if concurrency < max_concurrency and items_processed_in_stage >= threshold:
-                # 다음 병렬성 단계로 업데이트
-                concurrency = min(concurrency + step, max_concurrency)
-                # 현재 단계에서 처리된 항목 수 초기화
-                items_processed_in_stage = 0
-                # 진행률 표시줄에 새로운 병렬성 수준 표시
-                progress_bar.set_description(f"Parallelism: {concurrency}")
+                    try:
+                        result = await completed_task
+                        results[original_idx] = result
+                    except Exception as e:
+                        logging.error(f"Task {original_idx} failed: {e}")
+                        # 실패한 경우 원본 텍스트를 그대로 반환
+                        results[original_idx] = {
+                            "original_text": tasks[original_idx],
+                            "text": tasks[original_idx],
+                        }
+
+                    # 완료된 작업을 실행 목록에서 제거
+                    del running_tasks[completed_task]
+                    completed_count += 1
+                    items_processed_in_stage += 1
+
+                    # 진행률 업데이트
+                    progress_bar.update(1)
+
+                # 3. 병렬성 증가 조건 확인 및 업데이트
+                threshold = concurrency * 2
+                if (
+                    concurrency < max_concurrency
+                    and items_processed_in_stage >= threshold
+                ):
+                    # 다음 병렬성 단계로 업데이트
+                    concurrency = min(concurrency + step, max_concurrency)
+                    items_processed_in_stage = 0
+                    progress_bar.set_description(f"Parallelism: {concurrency}")
+
+        # 전역 변수 리셋
+        global_progress_bar = None
 
     return results
 
 
 async def main():
     print("📥 Loading dataset...")
-    ds = load_dataset("common-pile/arxiv_abstracts_filtered", split="train")
+    ds = load_dataset("minpeter/arxiv-abstracts-split", split="split_1")
     if MAX_PROCESSED_ROWS == -1:
         data = [{"text": t} for t in ds["text"]]
     else:
@@ -199,7 +261,9 @@ async def main():
     new_ds = Dataset.from_list(results)
 
     print(f"⬆️ Uploading to Hub: {HF_REPO} (private={HF_PRIVATE})")
-    new_ds.push_to_hub(HF_REPO, private=HF_PRIVATE, token=os.getenv("HF_TOKEN"))
+    new_ds.push_to_hub(
+        HF_REPO, private=HF_PRIVATE, token=os.getenv("HF_TOKEN"), split="split_1"
+    )
     print("✅ Upload complete!")
 
 
